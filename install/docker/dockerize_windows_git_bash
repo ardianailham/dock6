@@ -1,0 +1,204 @@
+#!/bin/bash
+
+# Default to Dockerfile.gnu_w_parallel if no argument is provided
+Dockerfile="${1:-Dockerfile.gnu_w_parallel}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Fix line endings on dispatcher.sh for Windows checkouts
+if [ -f "$SCRIPT_DIR/dispatcher.sh" ]; then
+    tr -d '\r' < "$SCRIPT_DIR/dispatcher.sh" > "$SCRIPT_DIR/dispatcher.sh.tmp" && mv "$SCRIPT_DIR/dispatcher.sh.tmp" "$SCRIPT_DIR/dispatcher.sh"
+    chmod +x "$SCRIPT_DIR/dispatcher.sh"
+fi
+
+echo "======================================================"
+echo " Building DOCK6 Docker image                          "
+echo "======================================================"
+echo "Dockerfile: $Dockerfile"
+echo "Repo Root:  $REPO_ROOT"
+
+docker build -f "$Dockerfile" -t dock6-suite "$REPO_ROOT"
+if [ $? -ne 0 ]; then
+    echo "Docker build failed!" 1>&2
+    exit 1
+fi
+
+mkdir -p "$REPO_ROOT/bin"
+cd "$REPO_ROOT/bin" || exit 1
+
+# 1. Generate dock6-suite.docker (POSIX / Git Bash / WSL runner)
+cat << 'EOF' > dock6-suite.docker
+#!/bin/bash
+
+# Prevent MSYS/MinGW on Windows from mangling volume colon-separated paths
+export MSYS_NO_PATHCONV=1
+
+usage() { 
+    echo "Usage: dock6-suite.docker [ -h help ] [ -b BINARY CALL WITH ARGUMENTS ] [ -v mounting files and folders ]" 1>&2;
+    echo "Interactive Mode Usage: dock6-suite.docker [ -h help ] [ -v mounting files and folders ]" 1>&2;
+    exit 1; 
+}
+
+CONTAINER_PATH="/app/workspace"
+VOLUMES=()
+BINARYCALL=""
+
+if [ $# -eq 0 ]; then
+    echo "No arguments provided...entering interactive mode"
+fi
+
+while getopts 'v:b:h' OPTION; do
+  case "$OPTION" in
+    v)
+      FULL_PATH="$(realpath "$OPTARG" 2>/dev/null || readlink -f "$OPTARG")"
+      BASE_NAME="$(basename "$OPTARG")"
+      VOLUMES+=("-v" "$FULL_PATH:$CONTAINER_PATH/$BASE_NAME")
+      ;;
+    b)
+      BINARYCALL="$OPTARG"
+      ;;
+    ? | h | *)
+      usage
+      ;;
+  esac
+done
+shift "$((OPTIND -1))"
+
+# Get working directory (supports Windows Git Bash pwd -W if available)
+HOST_DIR="$(pwd -W 2>/dev/null || pwd -P 2>/dev/null || pwd)"
+
+echo "#############################################################"
+echo "# Mounting working directory: $HOST_DIR -> $CONTAINER_PATH"
+if [ ${#VOLUMES[@]} -gt 0 ]; then
+    echo "# Additional volume mounts: ${VOLUMES[*]}"
+fi
+echo "# Working directory in container: $CONTAINER_PATH"
+if [ -n "$BINARYCALL" ]; then
+    echo "# Binary call: $BINARYCALL"
+else
+    echo "# Mode: Interactive bash shell"
+fi
+echo "#############################################################"
+
+if [ -z "$BINARYCALL" ]; then
+    docker run -it --rm --entrypoint /bin/bash \
+        "${VOLUMES[@]}" \
+        -v "$HOST_DIR:$CONTAINER_PATH" \
+        -w "$CONTAINER_PATH" \
+        dock6-suite
+else
+    docker run --rm \
+        "${VOLUMES[@]}" \
+        -v "$HOST_DIR:$CONTAINER_PATH" \
+        -w "$CONTAINER_PATH" \
+        --entrypoint /bin/bash \
+        dock6-suite -c "$BINARYCALL"
+fi
+EOF
+
+# 2. Generate dock6-suite.ps1 (PowerShell runner for Windows)
+cat << 'EOF' > dock6-suite.ps1
+<#
+.SYNOPSIS
+    DOCK6 Docker Suite Runner for Windows (PowerShell)
+.DESCRIPTION
+    Executes DOCK6 binaries or opens an interactive shell inside the dock6-suite Docker container.
+.PARAMETER b
+    The binary name and arguments to execute inside the container (e.g. "dock6 -i dock.in -o dock.out").
+.PARAMETER v
+    Additional file(s) or folder(s) to mount into the container workspace.
+.PARAMETER h
+    Display help and usage.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$b = "",
+
+    [Parameter(Mandatory=$false)]
+    [string[]]$v = @(),
+
+    [Parameter(Mandatory=$false)]
+    [switch]$h
+)
+
+function Show-Usage {
+    Write-Host "Usage:" -ForegroundColor Yellow
+    Write-Host '  Interactive: .\dock6-suite.ps1 [-v <path> ...]'
+    Write-Host '  Run Command: .\dock6-suite.ps1 -b "<binary> [args...]" [-v <path> ...]'
+    Write-Host ""
+    Write-Host "Examples:"
+    Write-Host '  .\dock6-suite.ps1'
+    Write-Host '  .\dock6-suite.ps1 -b "dock6 -i dock.in -o dock.out"'
+    Write-Host '  .\dock6-suite.ps1 -b "mpirun -n 4 dock6.mpi -i dock.in -o dock.out"'
+    Write-Host '  .\dock6-suite.ps1 -v "C:\path\to\extra_files" -b "dock6 -i dock.in -o dock.out"'
+    exit 1
+}
+
+if ($h) {
+    Show-Usage
+}
+
+$CONTAINER_PATH = "/app/workspace"
+$CurrentHostDir = (Get-Location).Path
+
+$VolumeArgs = @()
+if ($v) {
+    foreach ($item in $v) {
+        if (-not [string]::IsNullOrWhiteSpace($item)) {
+            if (Test-Path $item) {
+                $resolved = (Resolve-Path $item).Path
+                $leaf = Split-Path -Leaf $resolved
+                $VolumeArgs += "-v"
+                $VolumeArgs += "${resolved}:${CONTAINER_PATH}/${leaf}"
+            } else {
+                Write-Warning "Path to mount not found on host: $item"
+            }
+        }
+    }
+}
+
+Write-Host "#############################################################" -ForegroundColor Cyan
+Write-Host "# Working directory in container: $CONTAINER_PATH" -ForegroundColor Cyan
+Write-Host "# Host directory mounted:         $CurrentHostDir" -ForegroundColor Cyan
+if ($VolumeArgs.Count -gt 0) {
+    Write-Host "# Additional mounts:              $($VolumeArgs -join ' ')" -ForegroundColor Cyan
+}
+if (-not [string]::IsNullOrWhiteSpace($b)) {
+    Write-Host "# Binary call:                    $b" -ForegroundColor Cyan
+} else {
+    Write-Host "# Mode:                           Interactive bash shell" -ForegroundColor Cyan
+}
+Write-Host "#############################################################" -ForegroundColor Cyan
+
+if ([string]::IsNullOrWhiteSpace($b)) {
+    docker run -it --rm --entrypoint /bin/bash `
+        @VolumeArgs `
+        -v "${CurrentHostDir}:${CONTAINER_PATH}" `
+        -w $CONTAINER_PATH `
+        dock6-suite
+} else {
+    docker run --rm `
+        @VolumeArgs `
+        -v "${CurrentHostDir}:${CONTAINER_PATH}" `
+        -w $CONTAINER_PATH `
+        --entrypoint /bin/bash `
+        dock6-suite -c "$b"
+}
+EOF
+
+# 3. Generate dock6-suite.bat (CMD wrapper for Windows)
+cat << 'EOF' > dock6-suite.bat
+@echo off
+setlocal
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0dock6-suite.ps1" %*
+exit /b %ERRORLEVEL%
+EOF
+
+chmod u+x *docker *.sh 2>/dev/null || true
+
+echo "Setup complete! Created executable wrappers in $REPO_ROOT/bin:"
+echo "  - dock6-suite.ps1   (PowerShell)"
+echo "  - dock6-suite.bat   (CMD / Batch)"
+echo "  - dock6-suite.docker (Bash / Git Bash)"
